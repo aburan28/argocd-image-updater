@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
@@ -561,76 +562,148 @@ func mergeKustomizeOverride(t *kustomizeOverride, o *kustomizeOverride) {
 	}
 }
 
-// Check if a key exists in a MapSlice and return its index and value
-func findHelmValuesKey(m yaml.MapSlice, key string) (int, bool) {
-	for i, item := range m {
-		if item.Key == key {
+// setHelmValue updates currentValues (a yaml.MapSlice) by setting the nested value
+// at the dot-delimited key path (which may include numeric indices) to the provided value.
+// If a flat key (e.g. "image.tag") already exists in currentValues, it is updated directly.
+func setHelmValue(currentValues *yaml.MapSlice, key string, value interface{}) error {
+	// First, check if the full key already exists as a flat key.
+	if idx, found := findHelmValuesKey(*currentValues, key); found {
+		(*currentValues)[idx].Value = value
+		return nil
+	}
+
+	segments := strings.Split(key, ".")
+	updated, err := setHelmValueRecursive(*currentValues, segments, value)
+	if err != nil {
+		return err
+	}
+
+	// At the root level we expect a yaml.MapSlice.
+	m, ok := updated.(yaml.MapSlice)
+	if !ok {
+		return fmt.Errorf("expected yaml.MapSlice at root, got %T", updated)
+	}
+	*currentValues = m
+	return nil
+}
+
+// findHelmValuesKey searches for a map item with the given key in a yaml.MapSlice.
+func findHelmValuesKey(values yaml.MapSlice, key string) (int, bool) {
+	for i, item := range values {
+		if ks, ok := item.Key.(string); ok && ks == key {
 			return i, true
 		}
 	}
 	return -1, false
 }
 
-// set value of the parameter passed from the annotations.
-func setHelmValue(currentValues *yaml.MapSlice, key string, value interface{}) error {
-	// Check if the full key exists
-	if idx, found := findHelmValuesKey(*currentValues, key); found {
-		(*currentValues)[idx].Value = value
-		return nil
+// setHelmValueRecursive recursively traverses (or creates) the nested YAML structure.
+// It accepts an existing value (which may be nil, a yaml.MapSlice, or a []interface{})
+// and the key segments (e.g. ["containers", "0", "tag"]). If the remaining segments (joined by dot)
+// already exist as a flat key in the current map, then that key is updated directly.
+func setHelmValueRecursive(current interface{}, segments []string, value interface{}) (interface{}, error) {
+	// Base case: no more segments means we have reached the value to update.
+	if len(segments) == 0 {
+		return value, nil
 	}
 
-	var err error
-	keys := strings.Split(key, ".")
-	current := currentValues
-	var parent *yaml.MapSlice
-	parentIdx := -1
-
-	for i, k := range keys {
-		if idx, found := findHelmValuesKey(*current, k); found {
-			if i == len(keys)-1 {
-				// If we're at the final key, set the value and return
-				(*current)[idx].Value = value
-				return nil
-			} else {
-				// Navigate deeper into the map
-				if nestedMap, ok := (*current)[idx].Value.(yaml.MapSlice); ok {
-					parent = current
-					parentIdx = idx
-					current = &nestedMap
-				} else {
-					return fmt.Errorf("unexpected type %T for key %s", (*current)[idx].Value, k)
-				}
-			}
-		} else {
-			newCurrent := yaml.MapSlice{}
-			var newParent yaml.MapSlice
-
-			if i == len(keys)-1 {
-				newParent = append(*current, yaml.MapItem{Key: k, Value: value})
-			} else {
-				newParent = append(*current, yaml.MapItem{Key: k, Value: newCurrent})
-			}
-
-			if parent == nil {
-				*currentValues = newParent
-			} else {
-				// if parentIdx has not been set (parent element is also new), set it to the last element
-				if parentIdx == -1 {
-					parentIdx = len(*parent) - 1
-					if parentIdx < 0 {
-						parentIdx = 0
-					}
-				}
-				(*parent)[parentIdx].Value = newParent
-			}
-
-			parent = &newParent
-			current = &newCurrent
-			parentIdx = -1
+	// --- Early flat-key check ---
+	// If the current container is a map and it already contains a key
+	// that is the full remainder (e.g. "image.tag"), update it directly.
+	if m, ok := current.(yaml.MapSlice); ok {
+		flatKey := strings.Join(segments, ".")
+		if idx, found := findHelmValuesKey(m, flatKey); found {
+			m[idx].Value = value
+			return m, nil
 		}
 	}
 
-	return err
+	seg := segments[0]
+	// --- Handle numeric segment as a list index ---
+	if idx, err := strconv.Atoi(seg); err == nil {
+		var arr []interface{}
+		if current == nil {
+			// Create a slice long enough to hold the requested index.
+			arr = make([]interface{}, idx+1)
+		} else {
+			var ok bool
+			arr, ok = current.([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("expected list at segment %q, got %T", seg, current)
+			}
+			// Extend the slice if needed.
+			if len(arr) <= idx {
+				newArr := make([]interface{}, idx+1)
+				copy(newArr, arr)
+				arr = newArr
+			}
+		}
+		// If the target element is nil and there are further segments,
+		// pre-initialize it with the appropriate container.
+		if arr[idx] == nil && len(segments[1:]) > 0 {
+			// If the next segment is numeric, start with a slice; otherwise, with a yaml.MapSlice.
+			if _, err := strconv.Atoi(segments[1]); err == nil {
+				arr[idx] = make([]interface{}, 0)
+			} else {
+				arr[idx] = yaml.MapSlice{}
+			}
+		}
+		// Recurse into the list element.
+		updatedElem, err := setHelmValueRecursive(arr[idx], segments[1:], value)
+		if err != nil {
+			return nil, err
+		}
+		arr[idx] = updatedElem
+		return arr, nil
+	}
+
+	// --- Handle non-numeric segment as a map key ---
+	var m yaml.MapSlice
+	if current == nil {
+		m = yaml.MapSlice{}
+	} else {
+		var ok bool
+		m, ok = current.(yaml.MapSlice)
+		if !ok {
+			return nil, fmt.Errorf("expected map at segment %q, got %T", seg, current)
+		}
+	}
+
+	// Look for an existing map item with key equal to seg.
+	found := false
+	for i, item := range m {
+		if keyStr, ok := item.Key.(string); ok && keyStr == seg {
+			updatedVal, err := setHelmValueRecursive(item.Value, segments[1:], value)
+			if err != nil {
+				return nil, err
+			}
+			m[i].Value = updatedVal
+			found = true
+			break
+		}
+	}
+
+	// If the key wasn't found, create a new item.
+	if !found {
+		var newVal interface{}
+		if len(segments) == 1 {
+			newVal = value
+		} else {
+			// Determine the container type for the next level.
+			if _, err := strconv.Atoi(segments[1]); err == nil {
+				newVal = make([]interface{}, 0)
+			} else {
+				newVal = yaml.MapSlice{}
+			}
+			var err error
+			newVal, err = setHelmValueRecursive(newVal, segments[1:], value)
+			if err != nil {
+				return nil, err
+			}
+		}
+		m = append(m, yaml.MapItem{Key: seg, Value: newVal})
+	}
+	return m, nil
 }
 
 func getWriteBackConfig(app *v1alpha1.Application, kubeClient *kube.ImageUpdaterKubernetesClient, argoClient ArgoCD) (*WriteBackConfig, error) {

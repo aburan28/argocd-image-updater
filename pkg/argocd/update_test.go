@@ -1826,7 +1826,66 @@ replicas: 1
 		assert.NotEmpty(t, yaml)
 		assert.Equal(t, strings.TrimSpace(strings.ReplaceAll(expected, "\t", "  ")), strings.TrimSpace(string(yaml)))
 	})
+	t.Run("Valid Helm source with Helm values file with a list", func(t *testing.T) {
+		expected := `
+containers:
+- name: busybox
+  image: busybox
+  tag: v1.0.0
+`
+		app := v1alpha1.Application{
+			ObjectMeta: v1.ObjectMeta{
+				Name: "testapp",
+				Annotations: map[string]string{
+					"argocd-image-updater.argoproj.io/image-list":              "busybox",
+					"argocd-image-updater.argoproj.io/write-back-method":       "git",
+					"argocd-image-updater.argoproj.io/write-back-target":       "helmvalues:./test-values.yaml",
+					"argocd-image-updater.argoproj.io/busybox.helm.image-name": "containers.0.image",
+					"argocd-image-updater.argoproj.io/busybox.helm.image-tag":  "containers.0.tag",
+				},
+			},
+			Spec: v1alpha1.ApplicationSpec{
+				Source: &v1alpha1.ApplicationSource{
+					RepoURL:        "https://example.com/example",
+					TargetRevision: "main",
+					Helm: &v1alpha1.ApplicationSourceHelm{
+						Parameters: []v1alpha1.HelmParameter{
+							{
+								Name:        "containers.0.image",
+								Value:       "busybox",
+								ForceString: true,
+							},
+							{
+								Name:        "containers.0.tag",
+								Value:       "v1.0.0",
+								ForceString: true,
+							},
+						},
+					},
+				},
+			},
+			Status: v1alpha1.ApplicationStatus{
+				SourceType: v1alpha1.ApplicationSourceTypeHelm,
+				Summary: v1alpha1.ApplicationSummary{
+					Images: []string{
+						"busybox:v0.0.0",
+					},
+				},
+			},
+		}
 
+		originalData := []byte(`
+containers:
+- name: busybox
+  image: busybox
+  tag: v0.0.0
+`)
+		yaml, err := marshalParamsOverride(&app, originalData)
+		require.NoError(t, err)
+		assert.NotEmpty(t, yaml)
+		fmt.Println(string(yaml))
+		assert.Equal(t, strings.TrimSpace(strings.ReplaceAll(expected, "\t", "  ")), strings.TrimSpace(string(yaml)))
+	})
 	t.Run("Failed to setValue image parameter version", func(t *testing.T) {
 		expected := `
 image:
